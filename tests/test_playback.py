@@ -2,7 +2,7 @@ import queue
 
 import numpy as np
 
-from mlx_speechd.playback import PlaybackHandle, PlaybackManager
+from mlx_speechd.playback import PlaybackError, PlaybackHandle, PlaybackManager
 
 
 def test_finish_drains_queued_audio_before_sentinel(monkeypatch) -> None:
@@ -47,3 +47,22 @@ def test_stop_discards_stale_queued_audio() -> None:
         pass
     else:  # pragma: no cover - assertion branch
         raise AssertionError("stop should leave only the wake-up sentinel queued")
+
+
+def test_push_surfaces_output_stream_open_failure(monkeypatch) -> None:
+    monkeypatch.delenv("MSD_PLAYBACK", raising=False)
+
+    def fail_output(self: PlaybackManager, handle: PlaybackHandle) -> None:
+        handle.error = "PortAudioError: test failure"
+        handle.ready_event.set()
+        self._drop(handle.request_id)
+
+    monkeypatch.setattr(PlaybackManager, "_run_sounddevice", fail_output)
+    manager = PlaybackManager()
+
+    try:
+        manager.push(1, np.zeros(10, dtype=np.float32), 24000)
+    except PlaybackError as exc:
+        assert "PortAudioError" in str(exc)
+    else:  # pragma: no cover - assertion branch
+        raise AssertionError("playback open failure should be visible to the request")

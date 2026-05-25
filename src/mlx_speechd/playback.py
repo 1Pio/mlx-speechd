@@ -16,8 +16,10 @@ class PlaybackHandle:
     sample_rate: int
     queue: "queue.Queue[np.ndarray | None]" = field(default_factory=queue.Queue)
     stop_event: threading.Event = field(default_factory=threading.Event)
+    ready_event: threading.Event = field(default_factory=threading.Event)
     thread: threading.Thread | None = None
     chunks_written: int = 0
+    error: str | None = None
 
     def push(self, audio: object) -> None:
         if not self.stop_event.is_set():
@@ -51,11 +53,22 @@ class PlaybackManager:
         handle.thread.start()
         return handle
 
-    def push(self, request_id: int, audio: object, sample_rate: int) -> None:
+    def prepare(self, request_id: int, sample_rate: int) -> None:
         with self._lock:
             handle = self._handles.get(request_id)
             if handle is None:
                 handle = self.start(request_id, sample_rate)
+        if not handle.ready_event.wait(timeout=3.0):
+            raise PlaybackError("audio output did not become ready within 3 seconds")
+        if handle.error:
+            raise PlaybackError(handle.error)
+
+    def push(self, request_id: int, audio: object, sample_rate: int) -> None:
+        self.prepare(request_id, sample_rate)
+        with self._lock:
+            handle = self._handles.get(request_id)
+        if handle is None:
+            raise PlaybackError("audio output stopped before audio could be queued")
         handle.push(audio)
 
     def finish(self, request_id: int) -> None:
@@ -87,6 +100,7 @@ class PlaybackManager:
             self._handles.pop(request_id, None)
 
     def _run_fake(self, handle: PlaybackHandle) -> None:
+        handle.ready_event.set()
         try:
             while True:
                 item = handle.queue.get()
@@ -108,6 +122,7 @@ class PlaybackManager:
                 dtype="float32",
                 latency="low",
             ) as stream:
+                handle.ready_event.set()
                 while True:
                     item = handle.queue.get()
                     if item is None:
@@ -118,5 +133,12 @@ class PlaybackManager:
                     if samples.size:
                         stream.write(samples.reshape(-1, 1))
                         handle.chunks_written += 1
+        except Exception as exc:
+            handle.error = f"{type(exc).__name__}: {exc}"
+            handle.ready_event.set()
         finally:
             self._drop(handle.request_id)
+
+
+class PlaybackError(RuntimeError):
+    pass
