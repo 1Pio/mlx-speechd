@@ -23,8 +23,16 @@ class PlaybackHandle:
         if not self.stop_event.is_set():
             self.queue.put(as_float32_mono(audio))
 
-    def close(self) -> None:
+    def finish(self) -> None:
+        self.queue.put(None)
+
+    def stop(self) -> None:
         self.stop_event.set()
+        while True:
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                break
         self.queue.put(None)
 
 
@@ -54,7 +62,7 @@ class PlaybackManager:
         with self._lock:
             handle = self._handles.get(request_id)
         if handle is not None:
-            handle.close()
+            handle.finish()
 
     def stop(self, request_id: int | None = None) -> list[int]:
         with self._lock:
@@ -64,7 +72,7 @@ class PlaybackManager:
                 ids = [request_id] if request_id in self._handles else []
             handles = [self._handles[rid] for rid in ids]
         for handle in handles:
-            handle.close()
+            handle.stop()
         return ids
 
     def active_ids(self) -> list[int]:
@@ -80,10 +88,12 @@ class PlaybackManager:
 
     def _run_fake(self, handle: PlaybackHandle) -> None:
         try:
-            while not handle.stop_event.is_set():
+            while True:
                 item = handle.queue.get()
                 if item is None:
                     return
+                if handle.stop_event.is_set():
+                    continue
                 handle.chunks_written += 1
         finally:
             self._drop(handle.request_id)
@@ -98,10 +108,12 @@ class PlaybackManager:
                 dtype="float32",
                 latency="low",
             ) as stream:
-                while not handle.stop_event.is_set():
+                while True:
                     item = handle.queue.get()
                     if item is None:
                         return
+                    if handle.stop_event.is_set():
+                        continue
                     samples = as_float32_mono(item)
                     if samples.size:
                         stream.write(samples.reshape(-1, 1))
