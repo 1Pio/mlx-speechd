@@ -4,6 +4,7 @@ import os
 import queue
 import threading
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 
@@ -41,6 +42,7 @@ class PlaybackHandle:
 class PlaybackManager:
     def __init__(self) -> None:
         self._lock = threading.RLock()
+        self._backend_lock = threading.RLock()
         self._handles: dict[int, PlaybackHandle] = {}
         self._fake = os.environ.get("MSD_PLAYBACK", "").lower() == "fake"
 
@@ -116,12 +118,7 @@ class PlaybackManager:
         import sounddevice as sd
 
         try:
-            with sd.OutputStream(
-                samplerate=handle.sample_rate,
-                channels=1,
-                dtype="float32",
-                latency="low",
-            ) as stream:
+            with self._open_output_stream(sd, handle) as stream:
                 handle.ready_event.set()
                 while True:
                     item = handle.queue.get()
@@ -129,7 +126,7 @@ class PlaybackManager:
                         return
                     if handle.stop_event.is_set():
                         continue
-                    samples = as_float32_mono(item)
+                    samples = resample_linear(as_float32_mono(item), handle.sample_rate, int(stream.samplerate))
                     if samples.size:
                         stream.write(samples.reshape(-1, 1))
                         handle.chunks_written += 1
@@ -139,6 +136,60 @@ class PlaybackManager:
         finally:
             self._drop(handle.request_id)
 
+    def _open_output_stream(self, sd: Any, handle: PlaybackHandle) -> Any:  # pragma: no cover - live smoke
+        errors: list[Exception] = []
+        for attempt in range(2):
+            try:
+                output_rate = self._default_output_sample_rate(sd) or handle.sample_rate
+                return sd.OutputStream(
+                    samplerate=output_rate,
+                    channels=1,
+                    dtype="float32",
+                    latency="low",
+                )
+            except Exception as exc:
+                errors.append(exc)
+                if attempt == 0:
+                    self._reset_sounddevice(sd)
+                    continue
+                raise PlaybackError("; after PortAudio reset: ".join(str(error) for error in errors)) from exc
+        raise PlaybackError("audio output stream could not be opened")
+
+    @staticmethod
+    def _default_output_sample_rate(sd: Any) -> int | None:  # pragma: no cover - live smoke
+        try:
+            device = sd.query_devices(kind="output")
+            return int(float(device.get("default_samplerate") or 0)) or None
+        except Exception:
+            return None
+
+    def _reset_sounddevice(self, sd: Any) -> None:  # pragma: no cover - live smoke
+        with self._backend_lock:
+            try:
+                sd.stop()
+            except Exception:
+                pass
+            terminate = getattr(sd, "_terminate", None)
+            initialize = getattr(sd, "_initialize", None)
+            if callable(terminate) and callable(initialize):
+                try:
+                    terminate()
+                except Exception:
+                    pass
+                initialize()
+
 
 class PlaybackError(RuntimeError):
     pass
+
+
+def resample_linear(samples: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:
+    if samples.size == 0 or source_rate == target_rate:
+        return samples
+    if source_rate <= 0 or target_rate <= 0:
+        return samples
+    duration = samples.size / float(source_rate)
+    target_size = max(1, int(round(duration * target_rate)))
+    source_x = np.linspace(0.0, duration, num=samples.size, endpoint=False)
+    target_x = np.linspace(0.0, duration, num=target_size, endpoint=False)
+    return np.ascontiguousarray(np.interp(target_x, source_x, samples).astype(np.float32))

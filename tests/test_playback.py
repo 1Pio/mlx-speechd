@@ -2,7 +2,7 @@ import queue
 
 import numpy as np
 
-from mlx_speechd.playback import PlaybackError, PlaybackHandle, PlaybackManager
+from mlx_speechd.playback import PlaybackError, PlaybackHandle, PlaybackManager, resample_linear
 
 
 def test_finish_drains_queued_audio_before_sentinel(monkeypatch) -> None:
@@ -66,3 +66,60 @@ def test_push_surfaces_output_stream_open_failure(monkeypatch) -> None:
         assert "PortAudioError" in str(exc)
     else:  # pragma: no cover - assertion branch
         raise AssertionError("playback open failure should be visible to the request")
+
+
+def test_resample_linear_changes_sample_count() -> None:
+    samples = np.linspace(-0.5, 0.5, 240, dtype=np.float32)
+
+    resampled = resample_linear(samples, 24000, 48000)
+
+    assert resampled.dtype == np.float32
+    assert resampled.shape == (480,)
+
+
+def test_open_output_stream_uses_device_default_rate_and_retries() -> None:
+    manager = PlaybackManager()
+    handle = PlaybackHandle(request_id=1, sample_rate=24000)
+
+    class FakeStream:
+        def __init__(self, samplerate: int, channels: int, dtype: str, latency: str) -> None:
+            self.samplerate = samplerate
+            self.channels = channels
+            self.dtype = dtype
+            self.latency = latency
+
+    class FakeSoundDevice:
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+            self.stopped = False
+            self.terminated = False
+            self.initialized = False
+
+        def query_devices(self, kind: str) -> dict[str, float]:
+            assert kind == "output"
+            return {"default_samplerate": 44100.0}
+
+        def OutputStream(self, samplerate: int, channels: int, dtype: str, latency: str) -> FakeStream:
+            self.calls.append(samplerate)
+            if len(self.calls) == 1:
+                raise RuntimeError("first open failed")
+            return FakeStream(samplerate, channels, dtype, latency)
+
+        def stop(self) -> None:
+            self.stopped = True
+
+        def _terminate(self) -> None:
+            self.terminated = True
+
+        def _initialize(self) -> None:
+            self.initialized = True
+
+    sd = FakeSoundDevice()
+
+    stream = manager._open_output_stream(sd, handle)
+
+    assert stream.samplerate == 44100
+    assert sd.calls == [44100, 44100]
+    assert sd.stopped is True
+    assert sd.terminated is True
+    assert sd.initialized is True
